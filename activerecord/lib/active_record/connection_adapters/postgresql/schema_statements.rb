@@ -1,4 +1,5 @@
 # frozen_string_literal: true
+
 module ActiveRecord
   module ConnectionAdapters
     module PostgreSQL
@@ -145,7 +146,7 @@ module ActiveRecord
 
         # Returns an array of enum names defined in the database.
         def enums
-          query(<<~SQL, "SCHEMA").flatten
+          query(<<-SQL, "SCHEMA").flatten
             SELECT DISTINCT t.typname AS enum_name
             FROM pg_type t
             JOIN pg_enum e ON t.oid = e.enumtypid
@@ -540,7 +541,7 @@ module ActiveRecord
 
         # Returns the list of values of the enum with name +enum_name+.
         def enum_values(enum_name)
-          query(<<~SQL, "SCHEMA").flatten
+          query(<<-SQL, "SCHEMA").flatten
             SELECT unnest(enum_range(NULL::#{enum_name}))
           SQL
         end
