@@ -229,13 +229,6 @@ HEADER
         end
       end
 
-      def enum_values(stream)
-        if (enums = @connection.enums(table)).any?
-
-          stream.puts add_foreign_key_statements.sort.join("\n")
-        end
-      end
-
       def format_colspec(colspec)
         colspec.map { |key, value| "#{key}: #{value}" }.join(", ")
       end
