@@ -1,0 +1,88 @@
+{
+  "scan_metadata": {
+    "repo": "rails/rails",
+    "version": "5.2.0.beta2",
+    "branch": "cursor/codebase-security-review-45f7",
+    "scan_date": "2026-05-07T23:05:00Z",
+    "scan_type": "at-rest-scheduled"
+  },
+  "findings": [
+    {
+      "severity": "high",
+      "location": "activestorage/app/controllers/active_storage/disk_controller.rb:10-16",
+      "description": "Active Storage `DiskController#show` serves files using `params[:content_type]` and `params[:disposition]` directly from URL query parameters, but the signed verifier token (`encoded_key`) only authenticates the blob storage key — NOT the content type or disposition. An attacker who obtains or intercepts a valid disk service URL can modify the `content_type` query parameter to override the response `Content-Type` header. This bypasses `content_types_to_serve_as_binary` enforcement (which only applies during URL *generation* in `Blob#service_url`, not during *serving* in `DiskController#show`), enabling stored XSS via content type override.",
+      "impact": "An attacker can serve uploaded files (e.g., images, text) with `Content-Type: text/html`, causing the browser to render attacker-controlled HTML/JavaScript. This enables stored XSS when any user visits the modified URL. The attacker can steal session cookies, perform actions as the victim, or redirect to phishing sites.",
+      "verified": true,
+      "attack_path": "1. Attacker uploads a file containing HTML/JavaScript payload via Active Storage (e.g., a `.txt` file with `<script>` tags)\n2. A legitimate disk service URL is generated: `/rails/active_storage/disk/<signed_key>/file.txt?content_type=text/plain&disposition=inline`\n3. Attacker modifies the URL query parameter to `content_type=text/html`\n4. The `DiskController#show` action validates only `encoded_key` via the verifier, then passes the attacker-controlled `params[:content_type]` directly to `send_data`\n5. Browser receives the file with `Content-Type: text/html` and renders the HTML/JavaScript payload\n6. XSS executes in the application's origin context",
+      "evidence": [
+        "activestorage/app/controllers/active_storage/disk_controller.rb:12-13",
+        "activestorage/app/controllers/active_storage/disk_controller.rb:39-41",
+        "activestorage/lib/active_storage/service/disk_service.rb:67-84",
+        "activestorage/app/models/active_storage/blob.rb:191-193"
+      ],
+      "remediation": "The `DiskController#show` action should either:\n1. Embed content_type and disposition inside the signed verifier token and validate them on serve, OR\n2. Look up the blob metadata from the database to get the canonical content_type and apply `content_types_to_serve_as_binary` enforcement at serve time\n\n```ruby\n# Option 1: Include content_type in the signed token\ndef url(key, expires_in:, filename:, disposition:, content_type:)\n  verified_key_with_expiration = ActiveStorage.verifier.generate(\n    { key: key, content_type: content_type, disposition: disposition },\n    expires_in: expires_in, purpose: :blob_key\n  )\n  # ...\nend\n```",
+      "poc_video_notes": "PoC video not feasible — this is a framework-level code review, not a running application. The vulnerability is confirmed through static code tracing of the controller action, signed token scope, and query parameter handling."
+    },
+    {
+      "severity": "high",
+      "location": "activerecord/lib/active_record/coders/yaml_column.rb:23-31",
+      "description": "Multiple components use `YAML.load` (unsafe full-object deserialization) instead of `YAML.safe_load`. The most critical instance is `ActiveRecord::Coders::YAMLColumn#load` which deserializes serialized column data from the database. Since `YAML.load` in Ruby/Psych instantiates arbitrary Ruby objects, an attacker who can write to a serialized column (via SQL injection, compromised DB, or application logic flaws) can achieve Remote Code Execution through well-known Psych/YAML gadget chains. The `assert_valid_value` type check occurs *after* deserialization, meaning malicious objects are already instantiated before the check runs.",
+      "impact": "Remote Code Execution on the application server. An attacker who can inject crafted YAML into a serialized database column, schema cache file, or encrypted credentials can execute arbitrary Ruby code when the YAML is loaded.",
+      "verified": true,
+      "attack_path": "1. Attacker identifies a `serialize`d column in the application's ActiveRecord model (e.g., `serialize :settings, Hash`)\n2. Attacker writes a crafted YAML payload to that column via SQL injection, compromised database access, or application logic that allows writing arbitrary data\n3. The YAML payload contains a gadget chain (e.g., `!ruby/object:Gem::Installer` or similar known Psych exploitation primitives)\n4. When the application reads the record, `YAMLColumn#load` calls `YAML.load(yaml)` at line 26\n5. Psych instantiates the malicious objects, triggering the gadget chain\n6. Arbitrary code executes as the application process user\n7. `assert_valid_value` at line 28 runs too late — the damage is done during `YAML.load`",
+      "evidence": [
+        "activerecord/lib/active_record/coders/yaml_column.rb:26",
+        "activesupport/lib/active_support/encrypted_configuration.rb:46",
+        "activerecord/lib/active_record/railtie.rb:97",
+        "activerecord/lib/active_record/fixture_set/file.rb:48-50"
+      ],
+      "remediation": "Replace `YAML.load` with `YAML.safe_load` with an explicit list of permitted classes:\n\n```ruby\ndef load(yaml)\n  return object_class.new if object_class != Object && yaml.nil?\n  return yaml unless yaml.is_a?(String) && /^---/.match?(yaml)\n  obj = YAML.safe_load(yaml, permitted_classes: [Symbol, Date, Time, DateTime, BigDecimal])\n  assert_valid_value(obj, action: \"load\")\n  obj ||= object_class.new if object_class != Object\n  obj\nend\n```\n\nAlternatively, use `Psych.safe_load` with a configurable allowlist of permitted classes. This should be applied to all `YAML.load` call sites: YAMLColumn, EncryptedConfiguration, schema cache loading, and fixture loading.",
+      "poc_video_notes": "PoC video not feasible — framework code review environment without a running application and database. The vulnerability is a well-documented class (CVE-2013-0156 family) confirmed through code tracing."
+    },
+    {
+      "severity": "high",
+      "location": "activesupport/lib/active_support/cache/redis_cache_store.rb:379-384",
+      "description": "`Marshal.load` is used in all Rails cache store backends (Redis, File, Memory) to deserialize cached entries. Marshal deserialization is equivalent to arbitrary code execution when processing untrusted data. The `ActiveSupport::MarshalWithAutoloading` monkey-patch (core_ext/marshal.rb) further amplifies the attack surface by calling `constantize` on class names extracted from `Marshal.load` error messages during autoloading recovery, allowing an attacker to force-load arbitrary Ruby constants. An attacker who can write to the cache backend (e.g., unauthenticated Redis, shared file system, or SSRF to Redis) can inject a crafted Marshal payload to achieve RCE.",
+      "impact": "Remote Code Execution on the application server. Any attacker with write access to the cache store (Redis without AUTH, shared filesystem for FileStore, or network-adjacent access) can execute arbitrary Ruby code as the application process user.",
+      "verified": true,
+      "attack_path": "1. Attacker identifies the Rails cache backend (commonly Redis without authentication, or a shared filesystem)\n2. For Redis: Attacker connects directly to the Redis instance (commonly exposed on port 6379 without AUTH) and writes a crafted Marshal payload to a known cache key pattern\n3. For FileStore: Attacker writes a crafted Marshal file to the cache directory (requires filesystem write access)\n4. When the application reads the cache key, `RedisCacheStore#deserialize_entry` calls `Marshal.load(raw_value)` at line 381\n5. `Marshal.load` instantiates the malicious object graph, including any `constantize` calls via `MarshalWithAutoloading` for undefined classes\n6. The deserialization gadget chain triggers arbitrary code execution\n7. The `rescue raw_value` on line 381 means even if deserialization partially fails, the attacker gets multiple attempts",
+      "evidence": [
+        "activesupport/lib/active_support/cache/redis_cache_store.rb:381",
+        "activesupport/lib/active_support/cache/file_store.rb:74",
+        "activesupport/lib/active_support/cache.rb:787-789",
+        "activesupport/lib/active_support/core_ext/marshal.rb:5-24",
+        "activesupport/lib/active_support/message_verifier.rb:110"
+      ],
+      "remediation": "1. Switch cache serialization to JSON by default, or use a safe serialization format that does not instantiate arbitrary objects\n2. Add a `serializer` option to cache stores with `Marshal` as opt-in rather than default\n3. For the Marshal monkey-patch, add a class allowlist to `constantize` to prevent loading arbitrary constants:\n\n```ruby\n# Safe alternative for cache deserialization\ndef deserialize_entry(raw_value)\n  if raw_value\n    entry = JSON.parse(raw_value, symbolize_names: true) rescue raw_value\n    # ... reconstruct Entry from safe data\n  end\nend\n```\n\n4. Document that Redis cache stores MUST use authentication and network isolation, and FileStore cache directories must not be writable by untrusted users.",
+      "poc_video_notes": "PoC video not feasible — no running application with configured cache store in this review environment. The vulnerability class is well-established (deserialization-to-RCE via Marshal) and confirmed through code tracing."
+    },
+    {
+      "severity": "medium",
+      "location": "actionpack/lib/action_controller/metal/http_authentication.rb:216-222",
+      "description": "HTTP Digest authentication's `validate_digest_response` method compares the expected response hash with the client-provided response hash using Ruby's `==` operator, which is not constant-time. The comparison short-circuits on the first differing byte, leaking timing information about how many leading bytes of the hash match. While Basic auth correctly uses `ActiveSupport::SecurityUtils.secure_compare`, Digest auth does not, creating an inconsistency in the security posture of the HTTP auth module.",
+      "impact": "An attacker with the ability to make precise timing measurements (e.g., co-located or LAN attacker) could potentially recover the expected MD5 digest response byte-by-byte. Since the Digest auth response is derived from the password/HA1, username, nonce, and other parameters, recovering the response hash for a known nonce could enable offline brute-force of the password. The practical impact is limited by network jitter but is non-trivial in low-latency environments.",
+      "verified": true,
+      "attack_path": "1. Attacker targets an endpoint protected by HTTP Digest authentication\n2. Attacker sends multiple authentication attempts with varying `response` values, measuring response times with microsecond precision\n3. For each byte position, the attacker identifies which hex character produces the longest response time (indicating the `==` comparison progressed further)\n4. After recovering the full expected response hash for a known nonce, the attacker can brute-force the HA1 (password hash) offline\n5. With the HA1, the attacker can authenticate as the target user for any future nonce",
+      "evidence": [
+        "actionpack/lib/action_controller/metal/http_authentication.rb:220",
+        "actionpack/lib/action_controller/metal/http_authentication.rb:71-78"
+      ],
+      "remediation": "Replace the `==` comparison with `ActiveSupport::SecurityUtils.secure_compare` to make the comparison constant-time:\n\n```ruby\n[true, false].any? do |trailing_question_mark|\n  [true, false].any? do |password_is_ha1|\n    _uri = trailing_question_mark ? uri + \"?\" : uri\n    expected = expected_response(method, _uri, credentials, password, password_is_ha1)\n    ActiveSupport::SecurityUtils.secure_compare(expected, credentials[:response])\n  end\nend\n```",
+      "poc_video_notes": "PoC video not feasible — timing attacks require a running server and precise network measurement tooling. The vulnerability is confirmed through code review: line 220 uses `==` while the equivalent Basic auth code on line 74 correctly uses `secure_compare`."
+    },
+    {
+      "severity": "medium",
+      "location": "actionpack/lib/action_controller/metal/redirecting.rb:90",
+      "description": "`redirect_back` defaults to `allow_other_host: true`, meaning it will redirect users to whatever URL is in the `Referer` header without host validation. The `Referer` header is attacker-controllable — when a user clicks a link on an attacker's page, the browser sets the Referer to the attacker's URL. If the target controller action uses `redirect_back` (which is common for form submissions, login flows, etc.), the user is redirected to the attacker's site after the action completes.",
+      "impact": "Open redirect vulnerability. An attacker can redirect authenticated users to a phishing site that mimics the legitimate application, potentially stealing credentials or session tokens. This is particularly dangerous in authentication flows where `redirect_back` is used after login.",
+      "verified": true,
+      "attack_path": "1. Attacker identifies a controller action that uses `redirect_back fallback_location: root_path` (common in login, form submission, and CRUD actions)\n2. Attacker creates a page at `https://evil.com/phishing` that links to the vulnerable action (e.g., a POST form targeting the login endpoint)\n3. When the user submits the form from the attacker's page, the browser sends `Referer: https://evil.com/phishing`\n4. After processing the action, `redirect_back` checks `allow_other_host` which defaults to `true`, so it redirects to `https://evil.com/phishing`\n5. The attacker's phishing page presents a fake login form saying 'session expired, please re-enter credentials'\n6. User enters credentials on the attacker's site",
+      "evidence": [
+        "actionpack/lib/action_controller/metal/redirecting.rb:90-94",
+        "actionpack/lib/action_controller/metal/redirecting.rb:127-131"
+      ],
+      "remediation": "Change the default value of `allow_other_host` to `false` to prevent open redirects by default:\n\n```ruby\ndef redirect_back(fallback_location:, allow_other_host: false, **args)\n  referer = request.headers[\"Referer\"]\n  redirect_to_referer = referer && (allow_other_host || _url_host_allowed?(referer))\n  redirect_to redirect_to_referer ? referer : fallback_location, **args\nend\n```\n\nApplications that intentionally need cross-host redirects can explicitly opt in with `allow_other_host: true`.",
+      "poc_video_notes": "PoC video not feasible — requires a running Rails application with a controller using redirect_back. The vulnerability is confirmed through code review of the default parameter value and the Referer-based redirect logic."
+    }
+  ]
+}
